@@ -1,6 +1,6 @@
 # Personal Projects
 ---
-## Project :Poker AI
+## Project: Poker AI
 
 This project explores the development of a Poker AI using reinforcement learning and game-theory–inspired methods. The idea originated from an interview with a Mistral AI engineer, who advised me to develop personal machine learning projects. Since I enjoy poker, it became a natural fit.
 
@@ -11,7 +11,7 @@ The code is based on ```PypokerEngine``` library.
 
 
 ---
-## Project 3 : Skew of volatility
+## Project 3: Skew of volatility
 
 The idea is to use the historical time series of the excess return index assuming interest rates are equal to fed fund to imply what 
 implied volatility would on average over the period made the P&L of a delta hedged call option equal to zero.
@@ -161,9 +161,3 @@ Including the risk-free component (in green):
 Target volatility is shown in green.
 
 ---
-
-## Ongoing Improvements
-
-1. Project 2: Additional constraints
-    - Limit the maximum allocation to a single asset to avoid over-concentration driven by historical performance
-  

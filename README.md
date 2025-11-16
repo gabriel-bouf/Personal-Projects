@@ -1,4 +1,13 @@
 # Personal Projects
+---
+## Project :Poker AI
+
+This project explores the development of a Poker AI using reinforcement learning and game-theory–inspired methods. The idea originated from an interview with a Mistral AI engineer, who advised me to develop personal machine learning projects. Since I enjoy poker, it became a natural fit.
+
+The code is based on ```PypokerEngine``` library.
+
+### Work in progress
+
 
 
 ---

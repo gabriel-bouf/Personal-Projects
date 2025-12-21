@@ -1,12 +1,72 @@
-# Personal Projects
----
-## Project: Poker AI
+# Poker Reinforcement Learning Agent
 
-This project explores the development of a Poker AI using reinforcement learning and game-theory–inspired methods. The idea originated from an interview with a Mistral AI engineer, who advised me to develop personal machine learning projects. Since I enjoy poker, it became a natural fit.
+This project implements and compares Reinforcement Learning (RL) agents for No-Limit Texas Hold'em (simplified) using `PypokerEngine`. The objective is to train agents capable of outperforming heuristic baselines and evolving through Self-Play. The idea originated from an interview with a Mistral AI engineer, who advised me to develop personal machine learning projects. Since I enjoy poker, it became a natural fit.
 
-The code is based on ```PypokerEngine``` library.
+## Algorithms & Theory
 
-### Work in progress
+### 1. Q-Learning (Tabular)
+The agent uses a Q-table to learn the value of actions in discretized states. The update follows the Bellman equation:
+
+$$
+Q(S_t, A_t) \leftarrow Q(S_t, A_t) + \alpha \left[ R_{t+1} + \gamma \max_{a} Q(S_{t+1}, a) - Q(S_t, A_t) \right]
+$$
+
+Where $\alpha$ is the learning rate and $\gamma$ is the discount factor.
+
+### 2. Proximal Policy Optimization (PPO)
+An Actor-Critic method using neural networks to approximate policy $\pi_\theta$ and value $V_\phi$.
+
+**Generalized Advantage Estimation (GAE):**
+
+$$
+\hat{A}_t^{GAE} = \sum_{k=0}^{\infty} (\gamma \lambda)^k \delta_{t+k}
+$$
+With TD error:
+$$
+\delta_t = R_t + \gamma V(S_{t+1}) - V(S_t)
+$$
+
+**PPO Clipped Objective:**
+
+$$
+L^{CLIP}(\theta) = \hat{\mathbb{E}}_t \left[ \min(r_t(\theta)\hat{A}_t, \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon)\hat{A}_t) \right]
+$$
+
+### 3. Counterfactual Regret Minimization (CFR)
+*Currently under development.*
+
+CFR minimizes the cumulative counterfactual regret. The strategy is determined via Regret Matching, where the probability of action $a$ is proportional to its positive cumulative regret $R^+_T(I, a)$:
+
+$$
+\sigma_{T+1}(I, a) = \frac{R^+_T(I, a)}{\sum_{a'} R^+_T(I, a')}
+$$
+
+## Evaluation and Results
+
+The agents are evaluated against a set of fixed heuristic opponents (Random, Tight-Aggressive, Honest).
+
+<img width="2382" height="880" alt="comprehensive_evaluation" src="https://github.com/user-attachments/assets/de6c383b-e4d2-4af7-9ea3-d21b796ffc85" />
+
+
+### Performance Analysis
+
+The graph shows how each agent performs:
+
+1.  **Q-Learning**: Works well against Random players, but struggles with more sophisticated strategies (TAG, Honest). The tabular approach can't handle the complexity of poker states well enough.
+2.  **PPO**: Much stronger performance with only 2000 training iterations. The neural network architecture allows it to learn more nuanced strategies across all opponent types.
+3.  **Self-Play Impact**: Training against itself (instead of just fixed opponents) helped the PPO agent discover strategies beyond what the heuristics could teach. 
+
+## Usage
+
+**Requirements:** Python 3.8+, `pypokerengine`, `torch`, `numpy`, `matplotlib`.
+
+To run the training and evaluation pipeline:
+
+```bash
+python poker_rl_agent.py
+```
+
+### Work in Progress – CFR implementation, PPO improvement other features.
 
 
 

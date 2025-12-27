@@ -43,18 +43,36 @@ $$
 
 ## Evaluation and Results
 
-The agents are evaluated against a set of fixed heuristic opponents (Random, Tight-Aggressive, Honest).
+During training, the agents are evaluated against a set of fixed heuristic opponents (Random and Tight-Aggressive). It's currently a 50/50 between PPO and Q-learning, but PPO is just getting started! Its capacity for more complex strategy suggests it will pull ahead with further tuning.
 
-<img width="2382" height="880" alt="comprehensive_evaluation" src="https://github.com/user-attachments/assets/de6c383b-e4d2-4af7-9ea3-d21b796ffc85" />
+<img width="2382" height="880" alt="comprehensive_evaluation" src="https://github.com/user-attachments/assets/0d497be3-a845-46d3-a157-d6c5422efda8" />
 
 
 ### Performance Analysis
 
-The graph shows how each agent performs:
+The evaluation results (see `comprehensive_evaluation.png` above) demonstrate a significant performance gap between the agents:
 
-1.  **Q-Learning**: Works well against Random players, but struggles with more sophisticated strategies (TAG, Honest). The tabular approach can't handle the complexity of poker states well enough.
-2.  **PPO**: Much stronger performance with only 2000 training iterations. The neural network architecture allows it to learn more nuanced strategies across all opponent types.
-3.  **Self-Play Impact**: Training against itself (instead of just fixed opponents) helped the PPO agent discover strategies beyond what the heuristics could teach. 
+1.  **PPO (Proximal Policy Optimization)**: The clear winner. After stabilizing the training (feature scaling, extensive state vector, normalized rewards), the PPO agent achieves a positive win rate against all heuristic opponents, including the strong TAG (Tight Aggressive) baseline.
+2.  **Q-Learning**: Performs adequately against weak opponents (Random) but saturates against stronger strategies due to the discretization of the state space (losing nuance).
+
+#### Self-Play Evolution
+
+The PPO agent was trained using **Fictitious Self-Play** to prevent catastrophic forgetting. The graph below shows the win rate evolution during self-play generations:
+
+<img width="2082" height="730" alt="self_play_evolution" src="https://github.com/user-attachments/assets/d28a4e9f-bcef-4cd7-8359-fcb1d80e3b0b" />
+
+
+### PPO Configuration
+
+The PPO agent relies on a tuned hyperparameter configuration designed for stability over speed:
+
+*   **Network**: Actor-Critic (2 heads), Hidden Dim `256`
+*   **Learning Rate**: `1e-4` (Low to prevent policy collapse)
+*   **Batch Size**: `256` (Large batch to reduce variance)
+*   **Epochs per update**: `4` (Prevent overfitting to the current batch)
+*   **Entropy Coefficient**: `0.02` (Encourages exploration)
+*   **GAE Lambda**: `0.90` (Bias-variance trade-off for advantage estimation)
+*   **Clip Epsilon**: `0.2` (Usual clipping)
 
 ## Usage
 
@@ -66,7 +84,12 @@ To run the training and evaluation pipeline:
 python poker_rl_agent.py
 ```
 
-### Work in Progress – CFR implementation, PPO improvement other features.
+### Work in Progress – CFR implementation, PPO improvement, others features.
+
+
+
+
+
 
 
 

@@ -41,7 +41,7 @@ from torch.distributions import Categorical
 # CONSTANTS AND CONFIGURATION
 # ============================================================================
 
-ACTIONS = ["fold", "call", "raise"]
+ACTIONS = ["fold", "call", "raise_min", "raise_half_pot", "raise_pot", "all_in"]
 NUM_ACTIONS = len(ACTIONS)
 
 # Q-Learning hyperparameters
@@ -55,14 +55,27 @@ Q_LEARNING_CONFIG = {
 
 # PPO hyperparameters
 PPO_CONFIG = {
-    "lr": 3e-4,          # Learning rate
-    "gamma": 0.99,       # Discount factor
-    "gae_lambda": 0.95,  # GAE lambda
-    "clip_epsilon": 0.2, # PPO clipping
-    "entropy_coef": 0.01, # Entropy coefficient
-    "value_coef": 0.5,   # Value coefficient
-    "epochs": 4,         # Epochs per update
-    "batch_size": 64,    # Batch size
+    "lr": 3e-4,           # Learning rate (faster with clean reward signal)
+    "gamma": 0.99,        # Discount factor
+    "gae_lambda": 0.95,   # GAE lambda (less bias than 0.90)
+    "clip_epsilon": 0.2,  # PPO clipping
+
+    "entropy_coef": 0.05, # Entropy coefficient (more exploration)
+    "value_coef": 0.5,    # Value coefficient
+    "epochs": 4,          # Epochs per update
+    "batch_size": 64,     # Batch size (was 256, too large for heads-up)
+}
+
+# DQN hyperparameters
+DQN_CONFIG = {
+    "lr": 1e-4,
+    "gamma": 0.99,
+    "epsilon": 1.0,
+    "epsilon_min": 0.05,
+    "epsilon_decay": 0.9995,
+    "buffer_size": 10000,
+    "batch_size": 128,
+    "target_update": 10, # Update target network every N episodes
 }
 
 
@@ -131,11 +144,34 @@ def extract_state_features(hole_card: List[str], round_state: Dict[str, Any]) ->
     
     return (win_rate_bucket, street_idx, pot_bucket, num_raises_bucket)
 
-def extract_state_vector(hole_card: List[str], round_state: Dict[str, Any]) -> np.ndarray:
+def extract_state_vector(hole_card: List[str], round_state: Dict[str, Any], valid_actions: List[Dict] = None, my_uuid: str = None) -> np.ndarray:
     """
     Extracts feature vector for the PPO neural network.
     """
+    MAX_STACK = 2000.0 # Total chips in play usually
     features = []
+
+    if my_uuid is None:
+        my_uuid = round_state.get("next_player")  # fallback
+    
+    # 0. Position (Am I Dealer?)
+    dealer_btn = round_state.get("dealer_btn")
+    seats = round_state.get("seats", [])
+    my_seat_idx = -1
+    opponent_stack = 0
+    my_stack = 0
+    
+    for i, seat in enumerate(seats):
+        if seat.get("uuid") == my_uuid:
+            my_seat_idx = i
+            my_stack = seat.get("stack", 0)
+        else:
+            # Assumes Heads-Up for Opponent Stack
+            if seat.get("state") != "folded":
+                 opponent_stack = seat.get("stack", 0)
+    
+    is_dealer = 1.0 if my_seat_idx == dealer_btn else 0.0
+    features.append(is_dealer)
     
     # Hole cards (simplified one-hot encoding)
     cards = gen_cards(hole_card)
@@ -168,22 +204,19 @@ def extract_state_vector(hole_card: List[str], round_state: Dict[str, Any]) -> n
     
     # Normalized pot
     pot = round_state.get("pot", {}).get("main", {}).get("amount", 0)
-    features.append(min(pot / 1000.0, 1.0))
+    features.append(min(pot / MAX_STACK, 1.0))
     
-    # Normalized player stack
-    seats = round_state.get("seats", [])
-    my_stack = 1000
-    for seat in seats:
-        if seat.get("uuid") == round_state.get("next_player"):
-            my_stack = seat.get("stack", 1000)
-            break
-    features.append(min(my_stack / 1000.0, 1.0))
+    # Normalized player stack (Me)
+    features.append(min(my_stack / MAX_STACK, 1.0))
     
-    # Number of active players
+    # Normalized opponent stack (NEW)
+    features.append(min(opponent_stack / MAX_STACK, 1.0))
+    
+    # Number of active players (Normalized)
     active_players = sum(1 for s in seats if s.get("state") == "participating")
     features.append(active_players / 6.0)
     
-    # Estimation of win rate
+    # Estimation of win rate (simplified for speed/stability)
     if community:
         try:
             win_rate = estimate_hole_card_win_rate(
@@ -195,13 +228,70 @@ def extract_state_vector(hole_card: List[str], round_state: Dict[str, Any]) -> n
         except:
             win_rate = 0.5
     else:
-        # Preflop estimation
+        # Improved preflop heuristic
         card_values = [card.rank for card in cards]
-        pair = card_values[0] == card_values[1]
-        high_card = max(card_values)
-        win_rate = 0.5 + (high_card / 28.0) + (0.2 if pair else 0)
-        win_rate = min(0.95, max(0.2, win_rate))
+        high = max(card_values)
+        low = min(card_values)
+        gap = abs(card_values[0] - card_values[1])
+        pair = 1 if card_values[0] == card_values[1] else 0
+        suited = 1 if cards[0].suit == cards[1].suit else 0
+        connected = 1 if gap <= 2 else 0
+
+        win_rate = 0.30
+        win_rate += high / 28.0         # High card [0, 0.5]
+        win_rate += low / 56.0          # Kicker [0, 0.25]
+        win_rate += 0.12 * pair         # Pair bonus
+        win_rate += 0.04 * suited       # Suited bonus
+        win_rate += 0.03 * connected    # Connectivity
+        win_rate -= 0.02 * max(0, gap - 4)  # Gap penalty
+        win_rate = min(0.95, max(0.15, win_rate))
     features.append(win_rate)
+    
+    # --- CRITICAL NEW FEATURES (Opponent Context) ---
+    
+    # 1. Cost to call (Call Amount) - Normalized
+    call_amount = 0
+    valid_actions = round_state.get("valid_actions", []) # Need to ensure this is passed or inferred? 
+    # Actually round_state usually doesn't have valid_actions inside it in pypokerengine structure passed here?
+    # Wait, extract_state_vector signature is (hole_card, round_state).
+    # We might not have valid_actions here easily without passing them.
+    # Feature engineering from round_state ONLY:
+    
+    pot_amount = round_state.get("pot", {}).get("main", {}).get("amount", 0)
+    
+    # Infer call amount from effective stacks? Hard without valid_actions.
+    # But usually 'action_histories' tells us the last bet.
+    
+    # 2. Aggression (Number of raises in this street)
+    action_histories = round_state.get("action_histories", {})
+    current_street_actions = action_histories.get(street, [])
+    num_raises = sum(1 for a in current_street_actions if a["action"] == "raise")
+    features.append(min(num_raises / 5.0, 1.0))
+    
+    # 3. Did opponent raise last?
+    opponent_raised = 0.0
+    if current_street_actions:
+        last_action = current_street_actions[-1]
+        # Fix KeyError: action history uses 'uuid', receive_game_update uses 'player_uuid'
+        last_uuid = last_action.get("uuid") or last_action.get("player_uuid")
+        if last_uuid != round_state.get("next_player") and last_action["action"] == "raise":
+            opponent_raised = 1.0
+    features.append(opponent_raised)
+
+    # 4. Pot Odds (Cost / (Pot + Cost))
+    call_amount = 0
+    if valid_actions:
+         for a in valid_actions:
+             if a["action"] == "call":
+                 call_amount = a["amount"]
+                 break
+    
+    # Use MAX_STACK for consistency if needed, but ratio is unitless
+    features.append(min(call_amount / MAX_STACK, 1.0)) # NEW: Explicit call cost
+    
+    total_pot = pot_amount + call_amount
+    pot_odds = call_amount / total_pot if total_pot > 0 else 0
+    features.append(pot_odds)
     
     return np.array(features, dtype=np.float32)
 
@@ -254,12 +344,14 @@ class TightAggressivePlayer(BasePokerPlayer):
     Agent Tight-Aggressive (TAG) - Classic effective poker strategy.
     - Tight: Only plays good hands
     - Aggressive: Raise souvent quand il joue
+    - Position-aware: Plus loose en position dealer
     """
     
-    def __init__(self, tightness: float = 0.6, aggression: float = 0.7):
+    def __init__(self, tightness: float = 0.55, aggression: float = 0.75):
         super().__init__()
-        self.tightness = tightness  # Threshold to play a hand (0-1)
-        self.aggression = aggression  # Probability of raise vs call
+        self.tightness = tightness  # Threshold to play a hand (0-1) - LOWERED from 0.6
+        self.aggression = aggression  # Probability of raise vs call - INCREASED from 0.7
+        self.bluff_frequency = 0.12  # Occasional bluffs (12%)
     
     def _estimate_hand_strength(self, hole_card: List[str], round_state: Dict) -> float:
         """Estimates hand strength."""
@@ -304,23 +396,44 @@ class TightAggressivePlayer(BasePokerPlayer):
                        round_state: Dict) -> Tuple[str, int]:
         hand_strength = self._estimate_hand_strength(hole_card, round_state)
         
-        # Decision based on hand strenght
+        # Position awareness: looser on dealer button
+        dealer_btn = round_state.get("dealer_btn", 0)
+        seats = round_state.get("seats", [])
+        my_position = -1
+        for i, seat in enumerate(seats):
+            if seat.get("uuid") == self.uuid:
+                my_position = i
+                break
+        
+        is_dealer = (my_position == dealer_btn)
+        position_adjustment = 0.08 if is_dealer else 0.0  # Looser on button
+        adjusted_tightness = self.tightness - position_adjustment
+        
+        # Decision based on hand strength
         valid_action_types = {a["action"]: a for a in valid_actions}
         
+        # Occasional bluff (even with weak hand)
+        if random.random() < self.bluff_frequency and "raise" in valid_action_types:
+            if hand_strength > 0.25:  # Not completely trash
+                raise_info = valid_action_types["raise"]["amount"]
+                if isinstance(raise_info, dict):
+                    min_raise = max(0, raise_info.get("min", 0))
+                    return "raise", min_raise  # Small bluff
+        
         # Main trop faible -> fold (sauf si check gratuit)
-        if hand_strength < self.tightness * 0.5:
+        if hand_strength < adjusted_tightness * 0.5:
             if "call" in valid_action_types and valid_action_types["call"]["amount"] == 0:
                 return "call", 0  # Check gratuit
             return "fold", 0
         
         # Medium hand -> call or fold depending on cost
-        elif hand_strength < self.tightness:
+        elif hand_strength < adjusted_tightness:
             if "call" in valid_action_types:
                 call_amount = valid_action_types["call"]["amount"]
                 pot = round_state.get("pot", {}).get("main", {}).get("amount", 1)
                 pot_odds = call_amount / (pot + call_amount + 1)
                 
-                if pot_odds < hand_strength * 0.8:
+                if pot_odds < hand_strength * 0.85:  # Better pot odds calculation
                     return "call", call_amount
             return "fold", 0
         
@@ -597,6 +710,48 @@ class HonestPlayer(BasePokerPlayer):
         pass
 
 
+class RaisedPlayer(BasePokerPlayer):
+    """
+    External Benchmark: Simple aggressive player that always raises.
+    From PyPokerEngine examples - useful sanity check.
+    Should be beatable by any decent RL agent.
+    """
+    
+    def declare_action(self, valid_actions: List[Dict], hole_card: List[str],
+                       round_state: Dict) -> Tuple[str, int]:
+        valid_action_types = {a["action"]: a for a in valid_actions}
+        
+        # Always raise if possible
+        if "raise" in valid_action_types:
+            raise_info = valid_action_types["raise"]["amount"]
+            if isinstance(raise_info, dict):
+                return "raise", raise_info.get("min", 0)
+            return "raise", raise_info if raise_info else 0
+        
+        # Otherwise call
+        if "call" in valid_action_types:
+            return "call", valid_action_types["call"]["amount"]
+        
+        return "fold", 0
+    
+    def receive_game_start_message(self, game_info: Dict) -> None:
+        pass
+    
+    def receive_round_start_message(self, round_count: int, hole_card: List[str],
+                                    seats: List[Dict]) -> None:
+        pass
+    
+    def receive_street_start_message(self, street: str, round_state: Dict) -> None:
+        pass
+    
+    def receive_game_update_message(self, action: Dict, round_state: Dict) -> None:
+        pass
+    
+    def receive_round_result_message(self, winners: List[Dict], hand_info: List[Dict],
+                                     round_state: Dict) -> None:
+        pass
+
+
 # ============================================================================
 # AGENT Q-LEARNING
 # ============================================================================
@@ -627,6 +782,8 @@ class QLearningPlayer(BasePokerPlayer):
         
     def get_action_index(self, action_type: str) -> int:
         """Converts action type to index."""
+        if action_type == "raise":
+            return 2 # Map generic raise (pypokerengine) to raise_min (index 2) for Q-Learning
         return ACTIONS.index(action_type) if action_type in ACTIONS else 1
     
     def declare_action(self, valid_actions: List[Dict], hole_card: List[str], 
@@ -653,19 +810,39 @@ class QLearningPlayer(BasePokerPlayer):
         
         action_type = ACTIONS[action_idx]
         
-        # Find corresponding amount
+        # Mapping extended actions to pypokerengine actions
+        pypoker_action = "fold"
         amount = 0
-        for action in valid_actions:
-            if action["action"] == action_type:
-                if action_type == "raise":
-                    amt = action["amount"]
+        
+        if action_type == "fold":
+            pypoker_action = "fold"
+        elif action_type == "call":
+            pypoker_action = "call"
+            for a in valid_actions:
+                if a["action"] == "call":
+                    amount = a["amount"]
+                    break
+        else: # any raise
+            pypoker_action = "raise"
+            # Fallback to min raise for Q-Learning legacy interaction
+            # Get min raise
+            found_raise = False
+            for a in valid_actions:
+                if a["action"] == "raise":
+                    amt = a["amount"]
                     if isinstance(amt, dict):
-                        amount = max(0, amt.get("min", 0))
+                         amount = amt.get("min", 0)
                     else:
-                        amount = max(0, amt) if amt else 0
-                else:
-                    amount = action["amount"] if action["amount"] else 0
-                break
+                         amount = amt
+                    found_raise = True
+                    break
+            if not found_raise:
+                pypoker_action = "call" # Should not happen if logic is correct
+                for a in valid_actions:
+                    if a["action"] == "call":
+                        amount = a["amount"]
+                        break
+
         
         # Si l'action n'est pas valide, fall back on call
         if action_type not in valid_action_types:
@@ -772,7 +949,7 @@ class ActorCritic(nn.Module):
     Actor-Critic network for PPO
     """
     
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
         super().__init__()
         
         # Shared layers
@@ -783,12 +960,11 @@ class ActorCritic(nn.Module):
             nn.ReLU(),
         )
         
-        # Actor head (policy)
+        # Actor head (policy) — outputs raw logits, NO Softmax
         self.actor = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, action_dim),
-            nn.Softmax(dim=-1)
         )
         
         # Critic head (value)
@@ -800,27 +976,69 @@ class ActorCritic(nn.Module):
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         shared_features = self.shared(x)
-        action_probs = self.actor(shared_features)
+        logits = self.actor(shared_features)
         value = self.critic(shared_features)
-        return action_probs, value
-    
-    def get_action(self, state: np.ndarray, valid_mask: Optional[np.ndarray] = None
-                   ) -> Tuple[int, torch.Tensor, torch.Tensor]:
-        """Selects action with validity mask."""
+        return logits, value
+
+    def get_action(self, state: np.ndarray, valid_mask: Optional[np.ndarray] = None,
+                   deterministic: bool = False) -> Tuple[int, torch.Tensor, torch.Tensor]:
+        """Selects action with validity mask. Uses argmax if deterministic."""
         state_tensor = torch.FloatTensor(state).unsqueeze(0)
-        action_probs, value = self.forward(state_tensor)
-        
-        # Apply mask if provided
+        logits, value = self.forward(state_tensor)
+
+        # Mask invalid actions by setting logits to -inf
         if valid_mask is not None:
-            mask = torch.FloatTensor(valid_mask).unsqueeze(0)
-            action_probs = action_probs * mask
-            action_probs = action_probs / (action_probs.sum() + 1e-8)
-        
-        dist = Categorical(action_probs)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        
+            mask = torch.BoolTensor(valid_mask == 0).unsqueeze(0)
+            logits = logits.masked_fill(mask, float('-inf'))
+
+        if deterministic:
+            action = logits.argmax(dim=-1)
+            dist = Categorical(logits=logits)
+            log_prob = dist.log_prob(action)
+        else:
+            dist = Categorical(logits=logits)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+
         return action.item(), log_prob, value
+
+
+class DQNNetwork(nn.Module):
+    """
+    Deep Q-Network (Value-based)
+    """
+    
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim) # Output Q-values for all actions
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+@dataclass
+class DQNMemory:
+    """Replay buffer for DQN."""
+    buffer: list = field(default_factory=list)
+    capacity: int = 10000
+    
+    def push(self, transition: Tuple):
+        if len(self.buffer) >= self.capacity:
+            self.buffer.pop(0)
+        self.buffer.append(transition)
+        
+    def sample(self, batch_size: int) -> List[Tuple]:
+        return random.sample(self.buffer, batch_size)
+    
+    def __len__(self):
+        return len(self.buffer)
 
 
 @dataclass
@@ -852,7 +1070,7 @@ class PPOPlayer(BasePokerPlayer):
     Poker agent using PPO 
     """
     
-    STATE_DIM = 22  # State vector dimension
+    STATE_DIM = 28  # Fixed: Match actual element count (28)
     
     def __init__(self, config: Dict = None):
         super().__init__()
@@ -876,68 +1094,117 @@ class PPOPlayer(BasePokerPlayer):
         self.last_value = None
         self.last_valid_mask = None
         
+        # Running state normalization
+        self.state_mean = np.zeros(self.STATE_DIM, dtype=np.float32)
+        self.state_m2 = np.ones(self.STATE_DIM, dtype=np.float32)
+        self.state_count = 0
+
         # Statistiques
         self.episode_rewards = []
         self.current_episode_reward = 0
         self.losses = []
     
+    def normalize_state(self, state: np.ndarray) -> np.ndarray:
+        """Welford's online normalization."""
+        if self.training:
+            self.state_count += 1
+            delta = state - self.state_mean
+            self.state_mean += delta / self.state_count
+            delta2 = state - self.state_mean
+            self.state_m2 += delta * delta2
+        std = np.sqrt(self.state_m2 / max(self.state_count, 1)) + 1e-8
+        return (state - self.state_mean) / std
+
     def set_training(self, training: bool):
         """Enables or disables training mode."""
         self.training = training
         self.network.train(training)
     
-    def declare_action(self, valid_actions: List[Dict], hole_card: List[str], 
+    def declare_action(self, valid_actions: List[Dict], hole_card: List[str],
                        round_state: Dict) -> Tuple[str, int]:
-        state = extract_state_vector(hole_card, round_state)
-        
+        state = extract_state_vector(hole_card, round_state, valid_actions, my_uuid=self.uuid)
+        state = self.normalize_state(state)
+
         # Create validity mask
-        valid_action_types = [a["action"] for a in valid_actions]
+        # Map pypokerengine actions to our extended actions
+        valid_action_types = {a["action"] for a in valid_actions}
         valid_mask = np.zeros(NUM_ACTIONS)
-        for i, action_type in enumerate(ACTIONS):
-            if action_type in valid_action_types:
-                valid_mask[i] = 1.0
         
-        # Action selection
+        for i, action_name in enumerate(ACTIONS):
+            if action_name == "fold":
+                if "fold" in valid_action_types:
+                    valid_mask[i] = 1.0
+            elif action_name == "call":
+                if "call" in valid_action_types:
+                    valid_mask[i] = 1.0
+            elif "raise" in action_name or action_name == "all_in":
+                # Enable all raise variants if 'raise' is valid
+                if "raise" in valid_action_types:
+                    valid_mask[i] = 1.0
+        
+        # Action selection (argmax in inference, sample in training)
         with torch.no_grad() if not self.training else torch.enable_grad():
-            action_idx, log_prob, value = self.network.get_action(state, valid_mask)
+            action_idx, log_prob, value = self.network.get_action(
+                state, valid_mask, deterministic=not self.training
+            )
         
-        action_type = ACTIONS[action_idx]
+        action_name = ACTIONS[action_idx]
         
-        # Find amount
+        # Find corresponding amount & pypokerengine action
+        pypoker_action = "fold"
         amount = 0
-        for action in valid_actions:
-            if action["action"] == action_type:
-                if action_type == "raise":
-                    amt = action["amount"]
-                    if isinstance(amt, dict):
-                        amount = max(0, amt.get("min", 0))
-                    else:
-                        amount = max(0, amt) if amt else 0
-                else:
-                    amount = action["amount"] if action["amount"] else 0
-                break
         
-        # Fallback si action invalide
-        if action_type not in valid_action_types:
-            action_type = "call" if "call" in valid_action_types else valid_action_types[0]
+        if action_name == "fold":
+            pypoker_action = "fold"
+        elif action_name == "call":
+            pypoker_action = "call"
             for a in valid_actions:
-                if a["action"] == action_type:
-                    amt = a["amount"]
-                    if isinstance(amt, dict):
-                        amount = max(0, amt.get("min", 0))
-                    else:
-                        amount = max(0, amt) if amt else 0
+                if a["action"] == "call":
+                    amount = a["amount"]
                     break
-            action_idx = ACTIONS.index(action_type) if action_type in ACTIONS else 1
+        elif "raise" in action_name or action_name == "all_in":
+            pypoker_action = "raise"
+            
+            # Get raise limits
+            raise_limits = {}
+            for a in valid_actions:
+                if a["action"] == "raise":
+                    raise_limits = a["amount"]
+                    break
+            
+            if not raise_limits:
+                 # Fallback if raise not valid (e.g. capped)
+                 pypoker_action = "call"
+                 for a in valid_actions:
+                     if a["action"] == "call":
+                         amount = a["amount"]
+                         break
+            else:
+                 min_raise = raise_limits.get("min", 0)
+                 max_raise = raise_limits.get("max", 0)
+                 pot_amount = round_state.get("pot", {}).get("main", {}).get("amount", 0)
+                 
+                 if action_name == "raise_min":
+                     amount = min_raise
+                 elif action_name == "raise_half_pot":
+                     target = pot_amount * 0.5
+                     amount = int(max(min_raise, min(target, max_raise)))
+                 elif action_name == "raise_pot":
+                     target = pot_amount
+                     amount = int(max(min_raise, min(target, max_raise)))
+                 elif action_name == "all_in":
+                     amount = max_raise
+                 else:
+                     amount = min_raise
         
-        # Save for update
+        # Save for update (CRITICAL: Must be done before returning)
         self.last_state = state
         self.last_action = action_idx
         self.last_log_prob = log_prob
         self.last_value = value
         self.last_valid_mask = valid_mask
         
-        return action_type, amount
+        return pypoker_action, amount
     
     def store_transition(self, reward: float, done: bool = False):
         """Stores a transition in memory."""
@@ -979,7 +1246,7 @@ class PPOPlayer(BasePokerPlayer):
     
     def update(self):
         """Updates network with PPO."""
-        if len(self.memory) < self.config["batch_size"]:
+        if len(self.memory) < 32:
             return
         
         # Prepare data
@@ -1014,13 +1281,13 @@ class PPOPlayer(BasePokerPlayer):
                 batch_masks = valid_masks[batch_indices]
                 
                 # Forward pass
-                action_probs, values = self.network(batch_states)
-                
-                # Apply masks
-                action_probs = action_probs * batch_masks
-                action_probs = action_probs / (action_probs.sum(dim=-1, keepdim=True) + 1e-8)
-                
-                dist = Categorical(action_probs)
+                logits, values = self.network(batch_states)
+
+                # Mask invalid actions with -inf
+                invalid_mask = (batch_masks == 0)
+                logits = logits.masked_fill(invalid_mask, float('-inf'))
+
+                dist = Categorical(logits=logits)
                 new_log_probs = dist.log_prob(batch_actions)
                 entropy = dist.entropy().mean()
                 
@@ -1037,7 +1304,7 @@ class PPOPlayer(BasePokerPlayer):
                 
                 # Loss
                 actor_loss = -torch.min(surr1, surr2).mean()
-                critic_loss = nn.MSELoss()(values.squeeze(), batch_returns)
+                critic_loss = nn.MSELoss()(values.view(-1), batch_returns)
                 
                 loss = (actor_loss + 
                         self.config["value_coef"] * critic_loss - 
@@ -1060,26 +1327,45 @@ class PPOPlayer(BasePokerPlayer):
                                     seats: List[Dict]) -> None:
         self.last_state = None
         self.last_action = None
+        
+        # Track initial stack for this round
+        my_uuid = self.uuid
+        for seat in seats:
+            if seat["uuid"] == my_uuid:
+                self.initial_stack = seat["stack"]
+                break
+        else:
+            self.initial_stack = 1000  # Fallback
+
     
     def receive_street_start_message(self, street: str, round_state: Dict) -> None:
         pass
     
     def receive_game_update_message(self, action: Dict, round_state: Dict) -> None:
-        if self.training and self.last_state is not None:
-            self.store_transition(0.01)  # Small reward for staying in game
+        pass  # Only store transitions at round end (receive_round_result_message)
     
     def receive_round_result_message(self, winners: List[Dict], hand_info: List[Dict], 
                                      round_state: Dict) -> None:
         my_uuid = self.uuid
-        reward = 0
+        final_stack = 0
         
-        for winner in winners:
-            if winner.get("uuid") == my_uuid:
-                reward = winner.get("stack", 0) / 100.0
+        # Determine final stack from round_state seats
+        seats = round_state.get("seats", [])
+        for seat in seats:
+            if seat["uuid"] == my_uuid:
+                final_stack = seat["stack"]
                 break
         
-        if reward == 0:
-            reward = -0.5
+        # Calculate Net Profit
+        net_profit = final_stack - self.initial_stack
+        
+        # Normalize reward (Buy-in 1000)
+        # Scale to [-1, 1] roughly. 
+        # Winning 1000 -> +1.0. Losing 1000 -> -1.0.
+        reward = net_profit / 1000.0
+        
+        # Clip for stability
+        reward = max(-1.0, min(1.0, reward))
         
         self.store_transition(reward, done=True)
         self.episode_rewards.append(self.current_episode_reward)
@@ -1090,19 +1376,29 @@ class PPOPlayer(BasePokerPlayer):
             "network_state_dict": self.network.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "config": self.config,
+            "state_mean": self.state_mean,
+            "state_m2": self.state_m2,
+            "state_count": self.state_count,
         }, filepath)
-    
+
     def load(self, filepath: str):
         """Loads the agent."""
         checkpoint = torch.load(filepath, weights_only=False)
         self.network.load_state_dict(checkpoint["network_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.config = checkpoint["config"]
+        if "state_mean" in checkpoint:
+            self.state_mean = checkpoint["state_mean"]
+            self.state_m2 = checkpoint["state_m2"]
+            self.state_count = checkpoint["state_count"]
     
     def clone(self) -> "PPOPlayer":
         """Creates a copy of the agent for self-play."""
         clone = PPOPlayer(self.config.copy())
         clone.network.load_state_dict(copy.deepcopy(self.network.state_dict()))
+        clone.state_mean = self.state_mean.copy()
+        clone.state_m2 = self.state_m2.copy()
+        clone.state_count = self.state_count
         clone.set_training(False)
         return clone
 
@@ -1112,7 +1408,7 @@ class PPOPlayer(BasePokerPlayer):
 # ============================================================================
 
 def run_games(player1: BasePokerPlayer, player2: BasePokerPlayer, 
-              num_games: int = 100, initial_stack: int = 1000,
+              num_games: int = 500, initial_stack: int = 1000,
               small_blind: int = 10, verbose: bool = False) -> Dict[str, int]:
     """
     Runs a series of games between 2 players
@@ -1140,6 +1436,22 @@ def run_games(player1: BasePokerPlayer, player2: BasePokerPlayer,
             results["ties"] += 1
     
     return results
+
+
+def evaluate_agent(agent: BasePokerPlayer, opponent: BasePokerPlayer, num_games: int = 100) -> float:
+    """
+    Evaluates an agent against an opponent and returns win rate.
+    """
+    results = run_games(agent, opponent, num_games=num_games)
+    return results["player1_wins"] / num_games
+
+
+def evaluate_head_to_head(agent1: BasePokerPlayer, agent2: BasePokerPlayer, num_games: int = 500) -> float:
+    """
+    Evaluates agent1 vs agent2 head-to-head and returns win rate for agent1.
+    """
+    results = run_games(agent1, agent2, num_games=num_games)
+    return results["player1_wins"] / num_games
 
 
 def train_qlearning_vs_random(num_episodes: int = 5000, 
@@ -1199,30 +1511,239 @@ def train_qlearning_vs_random(num_episodes: int = 5000,
     return q_agent
 
 
-def train_ppo_vs_random(num_episodes: int = 3000, 
-                        eval_interval: int = 300,
-                        update_interval: int = 100) -> PPOPlayer:
+
+# ============================================================================
+# AGENT DQN
+# ============================================================================
+
+class DQNPlayer(BasePokerPlayer):
     """
-    Trains a PPO agent against random.
+    Poker agent using Deep Q-Network (DQN)
+    """
+    
+    STATE_DIM = 28
+    
+    def __init__(self, config: Dict = None):
+        super().__init__()
+        self.config = config or DQN_CONFIG
+        
+        # Networks (Policy + Target)
+        self.policy_net = DQNNetwork(self.STATE_DIM, NUM_ACTIONS)
+        self.target_net = DQNNetwork(self.STATE_DIM, NUM_ACTIONS)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+        
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.config["lr"])
+        self.memory = DQNMemory(capacity=self.config["buffer_size"])
+        
+        self.epsilon = self.config["epsilon"]
+        self.training = True
+        
+        # Episode tracking
+        self.last_state = None
+        self.last_action = None
+        self.episode_rewards = []
+        self.current_episode_reward = 0
+        self.losses = []
+        
+    def set_training(self, training: bool):
+        self.training = training
+        self.policy_net.train(training)
+        
+    def declare_action(self, valid_actions: List[Dict], hole_card: List[str],
+                       round_state: Dict) -> Tuple[str, int]:
+        state = extract_state_vector(hole_card, round_state, valid_actions, my_uuid=self.uuid)
+
+        # Valid mask
+        valid_action_types = {a["action"] for a in valid_actions}
+        valid_mask = np.zeros(NUM_ACTIONS)
+        for i, action_name in enumerate(ACTIONS):
+            if action_name == "fold":
+                if "fold" in valid_action_types: valid_mask[i] = 1.0
+            elif action_name == "call":
+                if "call" in valid_action_types: valid_mask[i] = 1.0
+            elif "raise" in action_name or action_name == "all_in":
+                if "raise" in valid_action_types: valid_mask[i] = 1.0
+            
+        # Select action
+        if self.training and random.random() < self.epsilon:
+            # Random valid action
+            valid_indices = [i for i, v in enumerate(valid_mask) if v == 1.0]
+            action_idx = random.choice(valid_indices)
+        else:
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(state).unsqueeze(0)
+                q_values = self.policy_net(state_tensor)
+                # Mask invalid actions with -infinity
+                q_values[0, valid_mask == 0] = -float('inf')
+                action_idx = q_values.argmax().item()
+        
+        action_name = ACTIONS[action_idx]
+        
+        # Calculate amount (Same logic as PPO)
+        pypoker_action = "fold"
+        amount = 0
+        
+        if action_name == "fold":
+            pypoker_action = "fold"
+        elif action_name == "call":
+            pypoker_action = "call"
+            for a in valid_actions:
+                 if a["action"] == "call": amount = a["amount"]; break
+        elif "raise" in action_name or action_name == "all_in":
+            pypoker_action = "raise"
+            raise_limits = {}
+            for a in valid_actions:
+                if a["action"] == "raise": raise_limits = a["amount"]; break
+            
+            if not raise_limits:
+                 # Fallback
+                 pypoker_action = "call"
+                 for a in valid_actions:
+                     if a["action"] == "call": amount = a["amount"]; break
+            else:
+                 min_raise = raise_limits.get("min", 0)
+                 max_raise = raise_limits.get("max", 0)
+                 pot_amount = round_state.get("pot", {}).get("main", {}).get("amount", 0)
+                 
+                 if action_name == "raise_min": amount = min_raise
+                 elif action_name == "raise_half_pot": amount = int(max(min_raise, min(pot_amount * 0.5, max_raise)))
+                 elif action_name == "raise_pot": amount = int(max(min_raise, min(pot_amount, max_raise)))
+                 elif action_name == "all_in": amount = max_raise
+                 else: amount = min_raise
+
+        # Store PREVIOUS transition if exists (S, A, 0, S', Done=False)
+        if self.last_state is not None and self.training:
+             self.memory.push((self.last_state, self.last_action, 0.0, state, False))
+             self.update()
+
+        # Store current state/action for next step
+        self.last_state = state
+        self.last_action = action_idx
+        
+        return pypoker_action, amount
+
+    def receive_game_start_message(self, game_info: Dict) -> None:
+        self.current_episode_reward = 0
+    
+    def receive_round_start_message(self, round_count: int, hole_card: List[str], seats: List[Dict]) -> None:
+        self.last_state = None
+        self.last_action = None
+        my_uuid = self.uuid
+        for seat in seats:
+            if seat["uuid"] == my_uuid:
+                self.initial_stack = seat["stack"]
+                break
+        else:
+            self.initial_stack = 1000
+
+    def receive_street_start_message(self, street: str, round_state: Dict) -> None:
+        pass
+    
+    def receive_game_update_message(self, action: Dict, round_state: Dict) -> None:
+        pass
+    
+    def receive_round_result_message(self, winners: List[Dict], hand_info: List[Dict], round_state: Dict) -> None:
+        my_uuid = self.uuid
+        final_stack = 0
+        seats = round_state.get("seats", [])
+        for seat in seats:
+            if seat["uuid"] == my_uuid:
+                final_stack = seat["stack"]
+                break
+        
+        # Reward Normalization
+        reward = (final_stack - self.initial_stack) / 1000.0
+        reward = max(-1.0, min(1.0, reward))
+        
+        # Store terminal transition (S, A, R, None, Done=True)
+        if self.last_state is not None:
+            self.memory.push((self.last_state, self.last_action, reward, None, True))
+        
+        self.episode_rewards.append(reward)
+        self.decay_epsilon()
+        self.update() # Learn at end of round
+    
+    def decay_epsilon(self):
+        self.epsilon = max(self.config["epsilon_min"], self.epsilon * self.config["epsilon_decay"])
+        
+    def update(self):
+        if len(self.memory) < self.config["batch_size"]: return
+        
+        transitions = self.memory.sample(self.config["batch_size"])
+        # Transpose batch
+        batch = list(zip(*transitions))
+        
+        states = torch.FloatTensor(np.array(batch[0]))
+        actions = torch.LongTensor(batch[1]).unsqueeze(1)
+        rewards = torch.FloatTensor(batch[2]).unsqueeze(1)
+        
+        # Handle None next_states
+        non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch[3])), dtype=torch.bool)
+        if any(non_final_mask):
+             non_final_next_states = torch.FloatTensor(np.array([s for s in batch[3] if s is not None]))
+        else:
+             non_final_next_states = torch.empty(0, self.STATE_DIM)
+        
+        dones = torch.FloatTensor(batch[4]).unsqueeze(1)
+        
+        # Q(s, a)
+        q_values = self.policy_net(states).gather(1, actions)
+        
+        # V(s') = max Q(s', a)
+        next_q_values = torch.zeros(self.config["batch_size"], 1)
+        with torch.no_grad():
+             if len(non_final_next_states) > 0:
+                next_q_values[non_final_mask] = self.target_net(non_final_next_states).max(1)[0].unsqueeze(1)
+        
+        # Target = R + gamma * V(s')
+        target_q_values = rewards + (self.config["gamma"] * next_q_values * (1 - dones))
+        
+        loss = nn.MSELoss()(q_values, target_q_values)
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        self.losses.append(loss.item())
+
+
+def train_ppo_curriculum(num_episodes: int = 5000, 
+                         eval_interval: int = 500,
+                         update_interval: int = 100) -> PPOPlayer:
+    """
+    Trains a PPO agent against a curriculum of opponents.
     """
     print("\n" + "="*60)
-    print(" TRAINING PPO vs RANDOM")
+    print(" TRAINING PPO (CURRICULUM)")
     print("="*60)
     
     ppo_agent = PPOPlayer()
-    random_agent = RandomPlayer()
+    
+    # Pool of opponents
+    opponents_pool = [
+        RandomPlayer(),
+        HonestPlayer(),
+        CallingStationPlayer(call_threshold=0.3),
+        TightAggressivePlayer(tightness=0.6, aggression=0.7),
+        LooseAggressivePlayer(looseness=0.3, aggression=0.8)
+    ]
     
     win_rates = []
     eval_episodes = []
     
-    for episode in tqdm(range(num_episodes), desc="PPO Training"):
+    for episode in tqdm(range(num_episodes), desc="PPO Curriculum Training"):
+        # Select random opponent
+        opponent = random.choice(opponents_pool)
+        opponent_name = opponent.__class__.__name__
+        
         config = setup_config(
             max_round=10,
             initial_stack=1000,
             small_blind_amount=10
         )
         config.register_player(name="ppo", algorithm=ppo_agent)
-        config.register_player(name="random", algorithm=random_agent)
+        config.register_player(name="opponent", algorithm=opponent)
         
         start_poker(config, verbose=0)
         
@@ -1230,39 +1751,40 @@ def train_ppo_vs_random(num_episodes: int = 3000,
         if (episode + 1) % update_interval == 0:
             ppo_agent.update()
         
-        # Periodic evaluation
+        # Periodic evaluation (always against TAG for consistency)
         if (episode + 1) % eval_interval == 0:
             ppo_agent.set_training(False)
-            results = run_games(ppo_agent, RandomPlayer(), num_games=100)
+            # Evaluate against a strong heuristic (TAG)
+            results = run_games(ppo_agent, TightAggressivePlayer(), num_games=100)
             win_rate = results["player1_wins"] / 100
             win_rates.append(win_rate)
             eval_episodes.append(episode + 1)
             
             avg_loss = np.mean(ppo_agent.losses[-100:]) if ppo_agent.losses else 0
-            print(f"\n Episode {episode + 1}: Win rate = {win_rate:.2%}, "
+            print(f"\n Episode {episode + 1}: Win rate vs TAG = {win_rate:.2%}, "
                   f"Avg Loss = {avg_loss:.4f}")
             
             ppo_agent.set_training(True)
     
-    # Graph
+    # Graph based on TAG performance
     plt.figure(figsize=(10, 6))
     plt.plot(eval_episodes, win_rates, 'g-o', linewidth=2, markersize=6)
-    plt.axhline(y=0.5, color='r', linestyle='--', label='Random baseline (50%)')
+    plt.axhline(y=0.5, color='r', linestyle='--', label='Baseline 50%')
     plt.xlabel('Episodes', fontsize=12)
-    plt.ylabel('Win rate', fontsize=12)
-    plt.title(' PPO: Evolution of win rate vs Random', fontsize=14)
+    plt.ylabel('Win rate vs TAG', fontsize=12)
+    plt.title(' PPO Curriculum: Evolution of win rate vs TAG', fontsize=14)
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.savefig('ppo_vs_random.png', dpi=150, bbox_inches='tight')
+    plt.savefig('ppo_curriculum.png', dpi=150, bbox_inches='tight')
     plt.close()
     
-    print(f"\n Graph saved: ppo_vs_random.png")
+    print(f"\n Graph saved: ppo_curriculum.png")
     
     return ppo_agent
 
 
 def train_self_play(agent: PPOPlayer, num_generations: int = 10,
-                    games_per_gen: int = 500, eval_games: int = 100) -> PPOPlayer:
+                    games_per_gen: int = 1000, eval_games: int = 100) -> PPOPlayer:
     """
     Trains PPO agent via self-play against prevous versions.
     """
@@ -1274,28 +1796,35 @@ def train_self_play(agent: PPOPlayer, num_generations: int = 10,
     win_rates_vs_previous = []
     generations = []
     
+    # Pool of opponents (Fictitious Self-Play)
+    # Start with a heuristic to ground the learning
+    opponents_pool = [RandomPlayer(), TightAggressivePlayer()]
+    
     current_agent = agent
-    previous_agent = current_agent.clone()
+    # Add initial copy to pool
+    opponents_pool.append(current_agent.clone())
     
     for gen in range(num_generations):
         print(f"\n Generation {gen + 1}/{num_generations}")
         
         current_agent.set_training(True)
         
-        # Training against previous version
+        # Training against pool of predecessors
         for episode in tqdm(range(games_per_gen), desc=f"Gen {gen + 1}"):
+            opponent = random.choice(opponents_pool)
+            
             config = setup_config(
                 max_round=10,
                 initial_stack=1000,
                 small_blind_amount=10
             )
             config.register_player(name="current", algorithm=current_agent)
-            config.register_player(name="previous", algorithm=previous_agent)
+            config.register_player(name="opponent", algorithm=opponent)
             
             start_poker(config, verbose=0)
             
-            # Periodic update
-            if (episode + 1) % 50 == 0:
+            # Periodic update (Collect more data before update)
+            if (episode + 1) % 100 == 0: # Increased from 50
                 current_agent.update()
         
         # Evaluation vs Random
@@ -1304,20 +1833,21 @@ def train_self_play(agent: PPOPlayer, num_generations: int = 10,
         win_rate_random = results_random["player1_wins"] / eval_games
         win_rates_vs_random.append(win_rate_random)
         
-        # Evaluation vs previous version
-        results_prev = run_games(current_agent, previous_agent, num_games=eval_games)
+        # Evaluation vs latest version in pool (excluding heuristics if pos)
+        last_opponent = opponents_pool[-1]
+        results_prev = run_games(current_agent, last_opponent, num_games=eval_games)
         win_rate_prev = results_prev["player1_wins"] / eval_games
         win_rates_vs_previous.append(win_rate_prev)
         
         generations.append(gen + 1)
         
         print(f"    vs Random: {win_rate_random:.2%}")
-        print(f"    vs Previous: {win_rate_prev:.2%}")
+        print(f"    vs Pool[-1]: {win_rate_prev:.2%}")
         
-        # Update opponent if we improved
-        if win_rate_prev > 0.55:
-            previous_agent = current_agent.clone()
-            print("    New version saved as opponent!")
+        # Always add new version to pool (FSP)
+        # This creates a diverse population of ancestors
+        print("    Current version added to opponent pool.")
+        opponents_pool.append(current_agent.clone())
     
     # Graph
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
@@ -1347,163 +1877,92 @@ def train_self_play(agent: PPOPlayer, num_generations: int = 10,
     return current_agent
 
 
-def comprehensive_evaluation(q_agent: QLearningPlayer, ppo_agent: PPOPlayer, 
-                             num_games: int = 200):
+def comprehensive_evaluation(q_agent: QLearningPlayer, ppo_agent: PPOPlayer, dqn_agent: DQNPlayer, num_games: int = 500):
     """
-    Complete evaluation of agents against different opponents.
+    Evaluates Q-Learning vs PPO vs DQN against ALL benchmarks.
     """
     print("\n" + "="*70)
-    print(" COMPLETE AGENT EVALUATION")
+    print(" COMPLETE AGENT EVALUATION (Q-Learning vs PPO vs DQN)")
     print("="*70)
     
-    # Disable training mode
-    q_agent.set_training(False)
-    ppo_agent.set_training(False)
-    
-    # Create opponents
-    opponents = {
+    test_opponents = {
         "Random": RandomPlayer(),
-        "TAG (Tight-Aggressive)": TightAggressivePlayer(tightness=0.6, aggression=0.7),
-        "LAG (Loose-Aggressive)": LooseAggressivePlayer(looseness=0.3, aggression=0.8),
-        "Calling Station": CallingStationPlayer(call_threshold=0.3),
+        "TAG": TightAggressivePlayer(),
+        "LAG": LooseAggressivePlayer(),
+        "CallingStation": CallingStationPlayer(),
         "Honest": HonestPlayer(),
+        "RaisedPlayer": RaisedPlayer()  # External benchmark
     }
     
-    # Results
-    results = {
-        "Q-Learning": {},
-        "PPO": {},
-    }
+    agents = {"Q-Learning": q_agent, "PPO": ppo_agent, "DQN": dqn_agent}
+    results = {name: {} for name in agents}
     
-    print(f"\n Evaluation on {num_games} games per matchup...\n")
+    for agent_name, agent_obj in agents.items():
+        print(f"\n {agent_name}:")
+        if hasattr(agent_obj, "set_training"):
+            agent_obj.set_training(False)
+            
+        for opp_name, opp_obj in test_opponents.items():
+            win_rate = evaluate_agent(agent_obj, opp_obj, num_games=num_games)
+            results[agent_name][opp_name] = win_rate
+            print(f"   vs {opp_name:<20}: {win_rate*100:5.1f}% ({int(win_rate*num_games)}/{num_games})")
+
+    # Direct Matches
+    print("\n DIRECT MATCHES:")
+    ql_ppo = evaluate_head_to_head(q_agent, ppo_agent, num_games)
+    print(f"   Q-Learning vs PPO: {ql_ppo*100:.1f}% for Q-Learning")
     
-    # Test Q-Learning against all opponents
-    print(" Q-Learning:")
-    for opp_name, opponent in opponents.items():
-        result = run_games(q_agent, opponent, num_games=num_games)
-        win_rate = result["player1_wins"] / num_games
-        results["Q-Learning"][opp_name] = win_rate
-        print(f"   vs {opp_name:25s}: {win_rate:6.1%} ({result['player1_wins']}/{num_games})")
+    dqn_ppo = evaluate_head_to_head(dqn_agent, ppo_agent, num_games)
+    print(f"   DQN vs PPO:        {dqn_ppo*100:.1f}% for DQN")
     
-    # Test PPO against all opponents
-    print("\n PPO:")
-    for opp_name, opponent in opponents.items():
-        result = run_games(ppo_agent, opponent, num_games=num_games)
-        win_rate = result["player1_wins"] / num_games
-        results["PPO"][opp_name] = win_rate
-        print(f"   vs {opp_name:25s}: {win_rate:6.1%} ({result['player1_wins']}/{num_games})")
+    dqn_ql = evaluate_head_to_head(dqn_agent, q_agent, num_games)
+    print(f"   DQN vs Q-Learning: {dqn_ql*100:.1f}% for DQN")
     
-    # Match direct: Q-Learning vs PPO
-    print("\n  DIRECT MATCH:")
-    result_q_vs_ppo = run_games(q_agent, ppo_agent, num_games=num_games)
-    result_ppo_vs_q = run_games(ppo_agent, q_agent, num_games=num_games)
+    # Plotting
+    labels = list(test_opponents.keys())
+    x = np.arange(len(labels))
+    width = 0.25 
     
-    q_total = result_q_vs_ppo["player1_wins"] + result_ppo_vs_q["player2_wins"]
-    ppo_total = result_q_vs_ppo["player2_wins"] + result_ppo_vs_q["player1_wins"]
-    total = 2 * num_games
+    fig, ax = plt.subplots(figsize=(12, 6))
     
-    print(f"   Q-Learning: {q_total}/{total} ({q_total/total:.1%})")
-    print(f"   PPO:        {ppo_total}/{total} ({ppo_total/total:.1%})")
+    rects1 = ax.bar(x - width, [results["Q-Learning"][l] for l in labels], width, label='Q-Learning', color='gray')
+    rects2 = ax.bar(x, [results["PPO"][l] for l in labels], width, label='PPO', color='blue')
+    rects3 = ax.bar(x + width, [results["DQN"][l] for l in labels], width, label='DQN', color='green')
     
-    # Moyennes
-    print("\n AVERAGES:")
-    q_avg = np.mean(list(results["Q-Learning"].values()))
-    ppo_avg = np.mean(list(results["PPO"].values()))
-    print(f"   Q-Learning (average all opponents): {q_avg:.1%}")
-    print(f"   PPO (average all opponents):        {ppo_avg:.1%}")
+    ax.set_ylabel('Win Rate')
+    ax.set_title('Agent Performance Comparison (Q-Learning vs PPO vs DQN)')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=15, ha='right')
+    ax.legend()
+    ax.axhline(y=0.5, color='r', linestyle='--', alpha=0.3)
+    ax.set_ylim(0, 1.05)  # Slightly higher to fit labels
+    ax.grid(True, alpha=0.3, axis='y')
     
-    # Performance contre opponents non-random
-    q_avg_hard = np.mean([v for k, v in results["Q-Learning"].items() if k != "Random"])
-    ppo_avg_hard = np.mean([v for k, v in results["PPO"].items() if k != "Random"])
-    print(f"\n   Q-Learning (excluding Random): {q_avg_hard:.1%}")
-    print(f"   PPO (excluding Random):        {ppo_avg_hard:.1%}")
-    
-    # Comparison graph
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    
-    # Graph 1: Performance par adversaire
-    ax1 = axes[0]
-    x = np.arange(len(opponents))
-    width = 0.35
-    
-    q_rates = [results["Q-Learning"][opp] for opp in opponents.keys()]
-    ppo_rates = [results["PPO"][opp] for opp in opponents.keys()]
-    
-    bars1 = ax1.bar(x - width/2, q_rates, width, label='Q-Learning', color='#3498db')
-    bars2 = ax1.bar(x + width/2, ppo_rates, width, label='PPO', color='#e74c3c')
-    
-    ax1.axhline(y=0.5, color='gray', linestyle='--', alpha=0.7, label='50% (baseline)')
-    ax1.set_ylabel('Win rate', fontsize=12)
-    ax1.set_xlabel('Opponent', fontsize=12)
-    ax1.set_title('Performance against different opponents', fontsize=14)
-    ax1.set_xticks(x)
-    ax1.set_xticklabels([o.replace(' ', '\n') for o in opponents.keys()], fontsize=9)
-    ax1.legend(loc='upper right')
-    ax1.set_ylim(0, 1)
-    ax1.grid(True, alpha=0.3, axis='y')
-    
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            height = bar.get_height()
-            ax1.annotate(f'{height:.0%}',
-                        xy=(bar.get_x() + bar.get_width() / 2, height),
-                        xytext=(0, 3),
+    # Add percentage labels on bars
+    def autolabel(rects):
+        for rect in rects:
+            height = rect.get_height()
+            ax.annotate(f'{height:.0%}',
+                        xy=(rect.get_x() + rect.get_width() / 2, height),
+                        xytext=(0, 3),  # 3 points vertical offset
                         textcoords="offset points",
-                        ha='center', va='bottom', fontsize=9)
+                        ha='center', va='bottom', fontsize=8)
     
-    # Graph 2: Summary
-    ax2 = axes[1]
-    categories = ['vs Random', 'vs TAG', 'vs Calling\nStation', 'vs Honest', 'MOYENNE\n(excluding Random)', 'vs Autre RL']
-    q_summary = [
-        results["Q-Learning"]["Random"],
-        results["Q-Learning"]["TAG (Tight-Aggressive)"],
-        results["Q-Learning"]["Calling Station"],
-        results["Q-Learning"]["Honest"],
-        q_avg_hard,
-        q_total / total
-    ]
-    ppo_summary = [
-        results["PPO"]["Random"],
-        results["PPO"]["TAG (Tight-Aggressive)"],
-        results["PPO"]["Calling Station"],
-        results["PPO"]["Honest"],
-        ppo_avg_hard,
-        ppo_total / total
-    ]
+    autolabel(rects1)
+    autolabel(rects2)
+    autolabel(rects3)
     
-    x2 = np.arange(len(categories))
-    bars3 = ax2.bar(x2 - width/2, q_summary, width, label='Q-Learning', color='#3498db')
-    bars4 = ax2.bar(x2 + width/2, ppo_summary, width, label='PPO', color='#e74c3c')
-    
-    ax2.axhline(y=0.5, color='gray', linestyle='--', alpha=0.7)
-    ax2.set_ylabel('Win rate', fontsize=12)
-    ax2.set_title('Performance summary', fontsize=14)
-    ax2.set_xticks(x2)
-    ax2.set_xticklabels(categories, fontsize=9)
-    ax2.legend(loc='upper right')
-    ax2.set_ylim(0, 1)
-    ax2.grid(True, alpha=0.3, axis='y')
-    
-    for bars in [bars3, bars4]:
-        for bar in bars:
-            height = bar.get_height()
-            ax2.annotate(f'{height:.0%}',
-                        xy=(bar.get_x() + bar.get_width() / 2, height),
-                        xytext=(0, 3),
-                        textcoords="offset points",
-                        ha='center', va='bottom', fontsize=9)
-    
-    plt.tight_layout()
-    plt.savefig('comprehensive_evaluation.png', dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    print(f"\n Graph saved: comprehensive_evaluation.png")
+    fig.tight_layout()
+    plt.savefig("comprehensive_evaluation.png")
+    print("\n Graph saved: comprehensive_evaluation.png")
+
     
     return results
 
 
+
 def compare_agents(q_agent: QLearningPlayer, ppo_agent: PPOPlayer, 
-                   num_games: int = 500):
+                   num_games: int = 1000):
     """
     Compares Q-Learning and PPO agent performances (simplified).
     """
@@ -1529,21 +1988,29 @@ def main():
     
     # Configuration
     Q_EPISODES = 3000      # Episodes for Q-Learning
-    PPO_EPISODES = 2000    # Episodes for PPO
+    PPO_EPISODES = 5000    # Episodes for PPO
     SELF_PLAY_GENS = 5     # Self-play generations
-    GAMES_PER_GEN = 300    # Games per generation
+    GAMES_PER_GEN = 2000    # Games per generation
     
     # -------------------------------------------------------------------------
-    # Step 1: Train Q-Learning vs Random
+    # Step 1: Load Best Q-Learning Agent
     # -------------------------------------------------------------------------
-    q_agent = train_qlearning_vs_random(num_episodes=Q_EPISODES, eval_interval=500)
-    q_agent.save("q_learning_agent.pkl")
-    print(f" Agent Q-Learning saved: q_learning_agent.pkl")
+    q_agent_path = "q_learning_agent_vboost.pkl" # 419 states
+    q_agent = QLearningPlayer()
+    
+    if os.path.exists(q_agent_path):
+        print(f"\n Loading existing Q-Learning agent: {q_agent_path}")
+        q_agent.load(q_agent_path)
+    else:
+        print(f"\n {q_agent_path} not found. Training from scratch...")
+        q_agent = train_qlearning_vs_random(num_episodes=Q_EPISODES, eval_interval=500)
+        q_agent.save("q_learning_agent.pkl")
+        print(f" Agent Q-Learning saved: q_learning_agent.pkl")
     
     # -------------------------------------------------------------------------
-    # Step 2: Train PPO vs Random
+    # Step 2: Train PPO Curriculum
     # -------------------------------------------------------------------------
-    ppo_agent = train_ppo_vs_random(num_episodes=PPO_EPISODES, eval_interval=200)
+    ppo_agent = train_ppo_curriculum(num_episodes=PPO_EPISODES, eval_interval=200)
     ppo_agent.save("ppo_agent_v1.pt")
     print(f" Agent PPO saved: ppo_agent_v1.pt")
     
@@ -1559,22 +2026,58 @@ def main():
     print(f" Agent PPO Self-Play saved: ppo_agent_selfplay.pt")
     
     # -------------------------------------------------------------------------
-    # Étape 4: Comparaison finale
+    # Step 4: Train DQN (New Benchmark)
     # -------------------------------------------------------------------------
-    compare_agents(q_agent, ppo_agent_selfplay, num_games=500)
+    print("\n" + "="*60)
+    print(" TRAINING DQN (Deep Q-Network)")
+    print("="*60)
+    
+    dqn_agent = DQNPlayer()
+    
+    # DQN uses replay buffer, so we use a simpler loop than PPO curriculum logic for now,
+    # or reuse similar curriculum. Let's do a simplified curriculum loop for 3000 episodes.
+    num_episodes_dqn = 3000
+    pbar = tqdm(range(num_episodes_dqn), desc="DQN Training")
+    
+    for episode in pbar:
+        # Curriculum
+        if episode < 500: opponent = RandomPlayer()
+        elif episode < 1500: opponent = CallingStationPlayer()
+        else: opponent = TightAggressivePlayer()
+        
+        config = setup_config(max_round=10, initial_stack=1000, small_blind_amount=10)
+        config.register_player(name="dqn", algorithm=dqn_agent)
+        config.register_player(name="opponent", algorithm=opponent)
+        
+        dqn_agent.set_training(True)
+        start_poker(config, verbose=0)
+        
+        if (episode+1) % 500 == 0:
+             dqn_agent.set_training(False)
+             wr = evaluate_agent(dqn_agent, TightAggressivePlayer(), 100)
+             pbar.set_description(f"DQN Training (WR vs TAG: {wr*100:.1f}%)")
+             
+    torch.save(dqn_agent.policy_net.state_dict(), "dqn_agent.pt")
+    print(f" Agent DQN saved: dqn_agent.pt")
+
+    # -------------------------------------------------------------------------
+    # Step 5: Final Comparison
+    # -------------------------------------------------------------------------
+    comprehensive_evaluation(q_agent, ppo_agent_selfplay, dqn_agent, num_games=500)
     
     print("\n" + "="*60)
     print(" TRAINING COMPLETED!")
     print("="*60)
     print("""
     Generated files:
-       • q_learning_agent.pkl     - Trained Q-Learning agent
-       • ppo_agent_v1.pt          - Agent PPO (vs Random)
-       • ppo_agent_selfplay.pt    - Agent PPO (after Self-Play)
-       • qlearning_vs_random.png  - Evolution graph Q-Learning
-       • ppo_vs_random.png        - Evolution graph PPO
-       • self_play_evolution.png  - Graph Self-Play
-       • agents_comparison.png    - Comparaison finale
+       • q_learning_agent_vboost.pkl - Trained Q-Learning agent
+       • ppo_agent_v1.pt             - Agent PPO (curriculum)
+       • ppo_agent_selfplay.pt       - Agent PPO (after Self-Play)
+       • dqn_agent.pt                - Agent DQN (Deep Q-Network)
+       • qlearning_vs_random.png     - Evolution graph Q-Learning
+       • ppo_curriculum.png          - Evolution graph PPO
+       • self_play_evolution.png     - Graph Self-Play
+       • comprehensive_evaluation.png - Final comparison (3 agents)
     """)
 
 
@@ -1590,27 +2093,38 @@ def evaluate_only():
     # Charger Q-Learning
     q_agent = QLearningPlayer()
     try:
-        with open("q_learning_agent.pkl", "rb") as f:
+        with open("q_learning_agent_vboost.pkl", "rb") as f:
             q_agent.q_table = pickle.load(f)
-        print(" Agent Q-Learning loaded (q_learning_agent.pkl)")
+        print(" Agent Q-Learning loaded (q_learning_agent_vboost.pkl)")
     except FileNotFoundError:
-        print(" q_learning_agent.pkl non found. Train first with main()")
+        print(" q_learning_agent_vboost.pkl not found. Train first with main()")
         return
     
     # Charger PPO
     ppo_agent = PPOPlayer()
     try:
-        ppo_agent.load("ppo_agent_v1.pt")
-        print(" Agent PPO loaded (ppo_agent_v1.pt)")
+        ppo_agent.load("ppo_agent_selfplay.pt")
+        print(" Agent PPO loaded (ppo_agent_selfplay.pt)")
     except FileNotFoundError:
-        print(" ppo_agent_v1.pt non found. Train first with main()")
+        print(" ppo_agent_selfplay.pt not found. Train first with main()")
+        return
+    
+    # Charger DQN
+    dqn_agent = DQNPlayer()
+    try:
+        dqn_agent.policy_net.load_state_dict(torch.load("dqn_agent.pt"))
+        dqn_agent.target_net.load_state_dict(torch.load("dqn_agent.pt"))
+        print(" Agent DQN loaded (dqn_agent.pt)")
+    except FileNotFoundError:
+        print(" dqn_agent.pt not found. Train first with main()")
         return
     
     # Run complete evaluation
-    comprehensive_evaluation(q_agent, ppo_agent, num_games=300)
+    comprehensive_evaluation(q_agent, ppo_agent, dqn_agent, num_games=500)
     
     print("\n Evaluation completed !")
     print(" Graph saved: comprehensive_evaluation.png")
+
 
 
 if __name__ == "__main__":
@@ -1619,4 +2133,3 @@ if __name__ == "__main__":
         evaluate_only()
     else:
         main()
-

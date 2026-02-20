@@ -1,0 +1,19 @@
+# Poker Reinforcement Learning Agent
+# ==================================
+# Installation: pip install -r requirements.txt
+
+# PyPokerEngine - Simulation de poker Texas Hold'em
+PyPokerEngine>=1.0.1
+
+# PyTorch - Deep Learning pour PPO
+torch>=2.0.0
+
+# NumPy - Calculs numériques
+numpy>=1.24.0
+
+# Matplotlib - Visualisation des graphiques
+matplotlib>=3.7.0
+
+# tqdm - Barres de progression
+tqdm>=4.65.0
+

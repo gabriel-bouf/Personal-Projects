@@ -1,0 +1,174 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Poker AI Arena</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=2">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <h1>Poker AI Arena</h1>
+            <div class="status-badge" id="game-status">Offline</div>
+        </header>
+
+        <!-- Session Info -->
+        <div class="session-info" id="session-info" style="display:none;">
+            <span>You: <strong id="persistent-human-stack">0</strong></span>
+            <span>Bot: <strong id="persistent-bot-stack">0</strong></span>
+            <span>Your buy-ins: <strong id="human-buyin-total">0</strong></span>
+            <span>Bot buy-ins: <strong id="bot-buyin-total">0</strong></span>
+        </div>
+
+        <!-- Start Controls -->
+        <div class="start-area" id="start-area">
+            <div class="mode-select">
+                <label>Mode:</label>
+                <select id="game-mode" onchange="onModeChange()">
+                    <option value="pvb">Play</option>
+                    <option value="bvb">Spectate (BvB)</option>
+                </select>
+            </div>
+            <div class="bot-select">
+                <label>Bot 1:</label>
+                <select id="bot-type">
+                    <option value="auto">Auto (best RL)</option>
+                    <option value="diffusion">PPO + Diffusion</option>
+                    <option value="ppo">PPO (standard)</option>
+                    <option value="tag">Tight Aggressive (TAG)</option>
+                    <option value="lag">Loose Aggressive (LAG)</option>
+                    <option value="calling_station">Calling Station</option>
+                    <option value="honest">Honest</option>
+                    <option value="random">Random</option>
+                </select>
+            </div>
+            <div class="bot-select" id="bot2-select" style="display:none;">
+                <label>Bot 2:</label>
+                <select id="bot2-type">
+                    <option value="random">Random</option>
+                    <option value="tag">Tight Aggressive (TAG)</option>
+                    <option value="lag">Loose Aggressive (LAG)</option>
+                    <option value="calling_station">Calling Station</option>
+                    <option value="honest">Honest</option>
+                    <option value="auto">Auto (best RL)</option>
+                    <option value="ppo">PPO (standard)</option>
+                    <option value="diffusion">PPO + Diffusion</option>
+                </select>
+            </div>
+            <button id="btn-buyin" onclick="buyIn()">Buy In (1000)</button>
+        </div>
+
+        <!-- Game Table -->
+        <div class="poker-table">
+
+            <!-- Bot (Top) -->
+            <div class="player-seat bot-seat">
+                <div class="avatar">&#x1F916;</div>
+                <div class="player-info">
+                    <div class="name" id="bot-name">PPO Agent</div>
+                    <div class="stack" id="bot-stack">1000</div>
+                </div>
+                <div class="cards" id="bot-cards" onclick="toggleBotCards()" title="Click to reveal">
+                    <div class="card back"></div>
+                    <div class="card back"></div>
+                </div>
+                <div class="bot-action-bubble" id="bot-action-bubble"></div>
+            </div>
+
+            <!-- Community Cards -->
+            <div class="community-area">
+                <div class="pot-display">Pot: <span id="pot-amount">0</span></div>
+                <div class="board" id="board-cards">
+                    <div class="card-placeholder"></div>
+                    <div class="card-placeholder"></div>
+                    <div class="card-placeholder"></div>
+                    <div class="card-placeholder"></div>
+                    <div class="card-placeholder"></div>
+                </div>
+                <div class="street-display" id="street-display"></div>
+            </div>
+
+            <!-- Human (Bottom) -->
+            <div class="player-seat human-seat active">
+                <div class="cards" id="human-cards">
+                    <!-- Cards injected here -->
+                </div>
+                <div class="player-info">
+                    <div class="name">You</div>
+                    <div class="stack" id="human-stack">1000</div>
+                </div>
+                <div class="avatar">&#x1F464;</div>
+            </div>
+
+        </div>
+
+        <!-- Round Winner Banner -->
+        <div class="round-winner-banner" id="round-winner-banner" style="display:none;"></div>
+
+        <!-- Controls -->
+        <div class="controls-area" id="controls">
+            <div class="action-info" id="action-info">Waiting for game to start...</div>
+            <div class="buttons" id="action-buttons">
+                <button class="btn btn-fold" onclick="sendAction('fold', 0)" id="btn-fold">Fold</button>
+                <button class="btn btn-check" onclick="sendCallAction()" id="btn-call">Check</button>
+                <button class="btn btn-raise" onclick="sendRaiseAction()" id="btn-raise">Raise</button>
+            </div>
+            <div id="next-hand-area" style="display:none;">
+                <button class="btn btn-next" onclick="sendNextHand()" id="btn-next-hand">Next Hand</button>
+            </div>
+            <div class="raise-controls" id="raise-controls" style="display:none;">
+                <input type="range" id="raise-slider" min="0" max="1000" value="50">
+                <div class="raise-info">
+                    <span id="raise-amount-display">50</span>
+                    <div class="raise-presets">
+                        <button class="btn-preset" onclick="setRaise('min')">Min</button>
+                        <button class="btn-preset" onclick="setRaise('half')">1/2 Pot</button>
+                        <button class="btn-preset" onclick="setRaise('pot')">Pot</button>
+                        <button class="btn-preset" onclick="setRaise('allin')">All-In</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Keyboard Hints (PvB only) -->
+        <div class="keyboard-hints" id="keyboard-hints">
+            <span class="hint-label">Shortcuts:</span>
+            <span class="hint-key">F</span> Fold
+            <span class="hint-key">C</span> Call/Check
+            <span class="hint-key">R</span> Raise
+            <span class="hint-key">1-9</span> Quick Raise (log scale)
+            <span class="hint-key">Space</span> Next Hand
+            <span class="hint-key">Esc</span> Close
+        </div>
+
+        <!-- BvB Controls (Spectator mode) -->
+        <div class="bvb-controls" id="bvb-controls" style="display:none;">
+            <button class="btn btn-pause" id="btn-bvb-pause" onclick="toggleBvbPause()">Pause</button>
+            <div class="speed-control">
+                <label>Speed:</label>
+                <button class="btn-preset" onclick="setBvbSpeed(2.0, this)">Slow</button>
+                <button class="btn-preset active-speed" onclick="setBvbSpeed(1.0, this)">Medium</button>
+                <button class="btn-preset" onclick="setBvbSpeed(0.3, this)">Fast</button>
+            </div>
+        </div>
+
+        <!-- Logs -->
+        <div class="logs-container">
+            <h3>Game Logs</h3>
+            <div class="logs-content" id="logs-list"></div>
+        </div>
+    </div>
+
+    <!-- Win/Lose Overlay -->
+    <div class="game-result-overlay" id="game-result-overlay" onclick="this.style.display='none'">
+        <div class="game-result-text" id="game-result-text"></div>
+        <div class="game-result-sub" id="game-result-sub"></div>
+    </div>
+
+    <script src="{{ url_for('static', filename='game.js') }}?v=2"></script>
+</body>
+</html>

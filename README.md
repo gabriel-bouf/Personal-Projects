@@ -87,6 +87,5 @@ python poker_rl_agent.py
 
 ### Work in Progress – CFR implementation, PPO improvement, others features.
 
-Target volatility is shown in green.
 
 ---
